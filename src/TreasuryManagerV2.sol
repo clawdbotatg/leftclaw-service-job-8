@@ -21,8 +21,8 @@ contract TreasuryManagerV2 is Ownable2Step, ReentrancyGuard {
     // ─── Base Mainnet Addresses (immutable) ───
     IWETH public constant WETH = IWETH(0x4200000000000000000000000000000000000006);
     IERC20 public constant USDC = IERC20(0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913);
-    IERC20 public constant USD = IERC20(0x583866fb22a3d67d7c45e1D0F34BcB20Bf9c6353);
-    IUniswapV3Pool public constant OFFICIAL_POOL = IUniswapV3Pool(0xAD501A478bF0F81C42C8C80ea08968f5Aa4c2f9A);
+    IERC20 public constant USD = IERC20(0x3d5e487B21E0569048c4D1A60E98C36e1B09DB07);
+    IUniswapV3Pool public constant OFFICIAL_POOL = IUniswapV3Pool(0xd013725b904e76394A3aB0334Da306C505D778F8);
     IStaking public constant STAKING = IStaking(0x2a70a42BC0524aBCA9Bff59a51E7aAdB575DC89A);
     ISwapRouter02 public constant V3_ROUTER = ISwapRouter02(0x2626664c2603336E57B271c5C0b26F421741e481);
     IUniversalRouter public constant UNIVERSAL_ROUTER = IUniversalRouter(0x6fF5693b99212Da76ad316178A184AB56D299b43);
