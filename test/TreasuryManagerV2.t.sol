@@ -20,6 +20,9 @@ contract TreasuryManagerV2Test is Test {
     // ─── Constructor Tests ───
 
     function test_constructorSetsOwner() public view {
+        // With Ownable2Step, ownership transfer is two-step
+        // Constructor sets pending owner, but since we use Ownable(_owner), 
+        // the owner is set directly via the Ownable constructor
         assertEq(treasury.owner(), owner);
     }
 

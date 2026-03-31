@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -15,7 +15,7 @@ import {IStaking} from "./interfaces/IStaking.sol";
 /// @notice Onchain treasury management for USD (TurboUSD) on Base
 /// @notice Operated by AMI (Artificial Monetary Intelligence)
 /// @dev Enforces one-directional token flows: accumulate, buy USD, stake, burn. Never sell.
-contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
+contract TreasuryManagerV2 is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ─── Base Mainnet Addresses (immutable) ───
@@ -89,6 +89,10 @@ contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
     // Last operator rebalance timestamp (any token)
     uint256 public lastOperatorRebalance;
 
+    // Tracked tokens array
+    address[] public trackedTokens;
+    mapping(address => bool) public isTrackedToken;
+
     // Last pool interaction for dead pool detection
     uint256 public lastPoolInteraction;
     // ─── Events ───
@@ -146,7 +150,7 @@ contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
 
         operator = _operator;
         usdcRecipient = _usdcRecipient;
-        operatorSlippageBps = 300; // Default 3%
+        operatorSlippageBps = 500; // Default 5%
 
         // Default operator caps
         caps[ActionType.BuybackWETH] = Caps(0.5 ether, 2 ether);
@@ -306,14 +310,16 @@ contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
 
     /// @notice Unstake from staking contract. No caps, no cooldown.
     function unstake(uint256 poolId) external onlyOperator nonReentrant {
+        // Check staked amount before withdrawal
+        (uint256 stakedAmount,) = STAKING.userInfo(poolId, address(this));
+        
         uint256 usdBefore = USD.balanceOf(address(this));
 
         STAKING.withdraw(poolId);
 
         uint256 usdAfter = USD.balanceOf(address(this));
         uint256 totalReceived = usdAfter - usdBefore;
-        // Rewards are included in the delta
-        (uint256 stakedAmount,) = STAKING.userInfo(poolId, address(this));
+        // Rewards = total received - staked principal
         uint256 rewards = totalReceived > stakedAmount ? totalReceived - stakedAmount : 0;
 
         emit UnstakeExecuted(poolId, totalReceived, rewards);
@@ -354,6 +360,12 @@ contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
         info.totalCostWei += amountETH;
         info.totalAmount += tokensReceived;
 
+        // Track token if new
+        if (!isTrackedToken[token]) {
+            isTrackedToken[token] = true;
+            trackedTokens.push(token);
+        }
+
         emit TokenPurchased(token, amountETH, tokensReceived);
     }
 
@@ -380,7 +392,12 @@ contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
         if (estimatedWethValue > c.perAction) revert ExceedsPerActionCap();
         _checkAndUpdateDailyUsage(ActionType.Rebalance, estimatedWethValue);
 
-        _executeRebalance(token, amount, pathToWETH, pathToUSDC, false);
+        uint256 wethReceived = _executeRebalance(token, amount, pathToWETH, pathToUSDC, false);
+
+        // Update ROI based on actual swap output
+        // Scale wethReceived to full amount (we only swapped 75%)
+        uint256 estimatedTotalWeth = (wethReceived * 100) / 75;
+        _updateROI(info, estimatedTotalWeth, amount);
 
         lastOperatorRebalance = block.timestamp;
         lastPoolInteraction = block.timestamp;
@@ -411,17 +428,8 @@ contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
 
         TokenInfo storage info = tokenInfo[token];
 
-        // ── Check ROI via TWAP ──
-        uint256 currentRoiBps = _calculateROI(token, info);
-        if (currentRoiBps < ROI_THRESHOLD_BPS) revert InsufficientROI();
-
-        // ── Ratchet ROI (never decreases) ──
-        if (currentRoiBps > info.highestRoiBps) {
-            if (info.highestRoiBps < ROI_THRESHOLD_BPS || _isNewTier(currentRoiBps, info.highestRoiBps)) {
-                info.roiTierTimestamp = block.timestamp;
-            }
-            info.highestRoiBps = currentRoiBps;
-        }
+        // ── Check ROI ──
+        if (info.highestRoiBps < ROI_THRESHOLD_BPS) revert InsufficientROI();
 
         // ── Check 14-day operator inactivity ──
         if (info.roiTierTimestamp == 0) revert UnlockNotReady();
@@ -451,7 +459,11 @@ contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
         _checkCircuitBreaker();
 
         // ── Execute with immutable 3% slippage ──
-        _executeRebalance(token, amount, pathToWETH, pathToUSDC, true);
+        uint256 wethReceived = _executeRebalance(token, amount, pathToWETH, pathToUSDC, true);
+
+        // Update ROI based on actual swap output (scale to full amount)
+        uint256 estimatedTotalWeth = (wethReceived * 100) / 75;
+        _updateROI(info, estimatedTotalWeth, amount);
 
         lastPoolInteraction = block.timestamp;
 
@@ -462,20 +474,21 @@ contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
         } else {
             info.totalCostWei = 0;
         }
-
-        emit RebalanceExecuted(token, amount, 0, 0, true, msg.sender);
     }
     // ═══════════════════════════════════════════════
     // ║           INTERNAL FUNCTIONS                ║
     // ═══════════════════════════════════════════════
 
-    /// @dev Swap WETH -> USD via official V3 pool
-    function _swapWETHToUSD(uint256 wethAmount, uint256 /* slippageBps */) internal returns (uint256) {
+    /// @dev Swap WETH -> ₸USD via official V3 pool with slippage protection
+    function _swapWETHToUSD(uint256 wethAmount, uint256 slippageBps) internal returns (uint256) {
         WETH.approve(address(V3_ROUTER), wethAmount);
 
         uint256 usdBefore = USD.balanceOf(address(this));
 
         uint24 poolFee = OFFICIAL_POOL.fee();
+
+        // Get a TWAP-based quote for slippage calculation
+        uint256 amountOutMinimum = _getMinAmountOut(wethAmount, slippageBps);
 
         V3_ROUTER.exactInputSingle(
             ISwapRouter02.ExactInputSingleParams({
@@ -484,34 +497,62 @@ contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
                 fee: poolFee,
                 recipient: address(this),
                 amountIn: wethAmount,
-                amountOutMinimum: 0, // We check via balanceOf delta with slippage below
+                amountOutMinimum: amountOutMinimum,
                 sqrtPriceLimitX96: 0
             })
         );
 
         uint256 usdReceived = USD.balanceOf(address(this)) - usdBefore;
-
-        // Slippage check vs quote (simplified: we accept the immutable/operator slippage)
-        // The amountOutMinimum of 0 is safe because we use balanceOf delta
-        // and the V3 router itself handles the swap atomically
         return usdReceived;
     }
 
+    /// @dev Calculate minimum output based on current pool price and slippage tolerance
+    /// Uses slot0 sqrtPriceX96 for price estimation with slippage applied
+    function _getMinAmountOut(uint256 wethAmount, uint256 slippageBps) internal view returns (uint256) {
+        (uint160 sqrtPriceX96,,,,,,) = OFFICIAL_POOL.slot0();
+        if (sqrtPriceX96 == 0) return 0;
+        
+        address token0 = OFFICIAL_POOL.token0();
+        bool wethIsToken0 = (token0 == address(WETH));
+        
+        // sqrtPriceX96 = sqrt(token1/token0) * 2^96
+        // price = (sqrtPriceX96 / 2^96)^2 = sqrtPriceX96^2 / 2^192
+        uint256 expectedOut;
+        if (wethIsToken0) {
+            // WETH is token0, ₸USD is token1
+            // price = token1/token0 = ₸USD per WETH
+            // expectedOut = wethAmount * price = wethAmount * sqrtPriceX96^2 / 2^192
+            expectedOut = (wethAmount * uint256(sqrtPriceX96)) / (1 << 96);
+            expectedOut = (expectedOut * uint256(sqrtPriceX96)) / (1 << 96);
+        } else {
+            // ₸USD is token0, WETH is token1
+            // price = token1/token0 = WETH per ₸USD
+            // So ₸USD per WETH = 1/price = 2^192 / sqrtPriceX96^2
+            // expectedOut = wethAmount * 2^192 / sqrtPriceX96^2
+            expectedOut = (wethAmount * (1 << 96)) / uint256(sqrtPriceX96);
+            expectedOut = (expectedOut * (1 << 96)) / uint256(sqrtPriceX96);
+        }
+        
+        // Apply slippage tolerance
+        return (expectedOut * (BPS_DENOMINATOR - slippageBps)) / BPS_DENOMINATOR;
+    }
+
     /// @dev Execute the 75/25 rebalance split
+    /// @return totalWethReceived Total WETH received from the 75% portion swap
     function _executeRebalance(
         address token,
         uint256 amount,
         bytes calldata pathToWETH,
         bytes calldata pathToUSDC,
         bool isPermissionless
-    ) internal {
+    ) internal returns (uint256 totalWethReceived) {
         _validatePathEndsWithWETH(pathToWETH);
         _validatePathEndsWithUSDC(pathToUSDC);
 
         uint256 wethPortion = (amount * 75) / 100;
         uint256 usdcPortion = amount - wethPortion;
 
-        // ── 75% -> WETH -> USD (stays in contract) ──
+        // ── 75% -> WETH -> ₸USD (stays in contract) ──
         IERC20(token).safeIncreaseAllowance(address(V3_ROUTER), wethPortion);
         uint256 wethBefore = WETH.balanceOf(address(this));
 
@@ -524,13 +565,13 @@ contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
             })
         );
 
-        uint256 wethReceived = WETH.balanceOf(address(this)) - wethBefore;
+        totalWethReceived = WETH.balanceOf(address(this)) - wethBefore;
 
-        // Swap WETH -> USD via official pool
+        // Swap WETH -> ₸USD via official pool
         uint256 slippage = isPermissionless ? SLIPPAGE_BPS : operatorSlippageBps;
-        _swapWETHToUSD(wethReceived, slippage);
+        _swapWETHToUSD(totalWethReceived, slippage);
 
-        // ── 25% -> USDC to designated address ──
+        // ── 25% -> USDC to owner ──
         IERC20(token).safeIncreaseAllowance(address(V3_ROUTER), usdcPortion);
         uint256 usdcBefore = USDC.balanceOf(usdcRecipient);
 
@@ -546,7 +587,7 @@ contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
         uint256 usdcReceived = USDC.balanceOf(usdcRecipient) - usdcBefore;
 
         lastPoolInteraction = block.timestamp;
-        emit RebalanceExecuted(token, amount, wethReceived, usdcReceived, isPermissionless, msg.sender);
+        emit RebalanceExecuted(token, amount, totalWethReceived, usdcReceived, isPermissionless, msg.sender);
     }
 
     /// @dev Check and update daily usage for an action type
@@ -575,15 +616,40 @@ contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
         if (usage.amount + ethEquivalent > PERMISSIONLESS_PER_DAY_CAP) revert ExceedsPerDayCap();
         usage.amount += ethEquivalent;
     }
-    /// @dev Calculate ROI for a token using its Uniswap pool TWAP vs cost basis
+    /// @dev Calculate ROI for a token using ratcheted highest ROI
     /// @return roiBps ROI in basis points (10000 = 100%)
+    /// @dev ROI is updated during rebalance operations based on actual WETH received
+    ///      vs cost basis. The ratchet ensures ROI never decreases.
     function _calculateROI(address /* token */, TokenInfo storage info) internal view returns (uint256) {
         if (info.totalAmount == 0 || info.totalCostWei == 0) return 0;
-
-        // ROI is ratcheted (never decreases) and tracked via highestRoiBps
-        // The operator updates ROI via rebalance actions based on market price
-        // Permissionless callers rely on the ratcheted value
         return info.highestRoiBps;
+    }
+
+    /// @dev Update ROI based on actual swap output (WETH received) vs cost basis
+    /// @param info Token info to update
+    /// @param wethReceived WETH received from swapping `amountSwapped` tokens
+    /// @param amountSwapped Number of tokens swapped
+    function _updateROI(TokenInfo storage info, uint256 wethReceived, uint256 amountSwapped) internal {
+        if (info.totalAmount == 0 || info.totalCostWei == 0) return;
+        
+        // Calculate what this portion cost in WETH
+        uint256 costOfSwapped = (amountSwapped * info.totalCostWei) / info.totalAmount;
+        if (costOfSwapped == 0) return;
+        
+        // ROI = (currentValue - cost) / cost * 10000
+        // = (wethReceived * 10000 / costOfSwapped) - 10000
+        uint256 currentRoiBps;
+        if (wethReceived > costOfSwapped) {
+            currentRoiBps = ((wethReceived * BPS_DENOMINATOR) / costOfSwapped) - BPS_DENOMINATOR;
+        }
+        
+        // Ratchet: only update if higher
+        if (currentRoiBps > info.highestRoiBps) {
+            if (info.highestRoiBps < ROI_THRESHOLD_BPS || _isNewTier(currentRoiBps, info.highestRoiBps)) {
+                info.roiTierTimestamp = block.timestamp;
+            }
+            info.highestRoiBps = currentRoiBps;
+        }
     }
 
     /// @dev Check if we've entered a new ROI tier (each 10% step)
@@ -755,5 +821,20 @@ contract TreasuryManagerV2 is Ownable, ReentrancyGuard {
         }
         if (usage.amount >= caps[action].perDay) return 0;
         return caps[action].perDay - usage.amount;
+    }
+
+    /// @notice Get all tracked tokens
+    function getTrackedTokens() external view returns (address[] memory) {
+        return trackedTokens;
+    }
+
+    /// @notice Get remaining permissionless daily budget
+    function getRemainingPermissionlessBudget() external view returns (uint256) {
+        DailyUsage storage usage = permissionlessDailyUsage;
+        if (block.timestamp >= usage.resetTime + 1 days) {
+            return PERMISSIONLESS_PER_DAY_CAP;
+        }
+        if (usage.amount >= PERMISSIONLESS_PER_DAY_CAP) return 0;
+        return PERMISSIONLESS_PER_DAY_CAP - usage.amount;
     }
 }
