@@ -1,148 +1,124 @@
-# 🏰 ÙSD - Treasury Manager
+# 🏦 ₸USD Treasury Manager V2
 
-**Operated by AMI (Artificial Monetary Intelligence)**
+Onchain treasury management contract for **₸USD (TurboUSD)** on **Base**, operated by AMI (Artificial Monetary Intelligence).
 
-## Overview
+The contract enforces strict one-directional token flows: tokens are accumulated into the treasury, ₸USD can only be **bought**, **staked**, or **burned** — **never sold**. A permissionless fallback mechanism guarantees ₸USD buybacks will continue even if the operator goes offline.
 
-TreasuryManagerV2 is an onchain treasury management contract for ÙSD (TurboUSD) on Base. It enforces strict one-directional token flows: tokens are accumulated into the treasury, ÙSD can only be bought, staked, or burned — never sold. A permissionless fallback mechanism guarantees ÙSD buybacks will continue even if the operator goes offline.
+## 🔗 Links
 
-## Architecture
+| Resource | Link |
+|----------|------|
+| **Frontend** | [IPFS Dashboard](https://bafybeidmputmhonuees4ww7kjokso46f2qf5d3vyrgemrznldpayl5a2pa.ipfs.community.bgipfs.com/) |
+| **Contract** | [`0xC5127c4b0e5AC19088D233AB43C0FFd1E1134332`](https://base.blockscout.com/address/0xC5127c4b0e5AC19088D233AB43C0FFd1E1134332) |
+| **₸USD Token** | [`0x3d5e487B21E0569048c4D1A60E98C36e1B09DB07`](https://basescan.org/token/0x3d5e487b21e0569048c4d1a60e98c36e1b09db07) |
+| **Official Pool** | [`0xd013725b904e76394A3aB0334Da306C505D778F8`](https://basescan.org/address/0xd013725b904e76394a3ab0334da306c505d778f8) |
+| **Network** | Base (Chain ID: 8453) |
 
-Single contract: `TreasuryManagerV2.sol` — no upgradeable proxy, no additional contracts needed.
+## 🏗 Architecture
 
-### Key Roles
+### Roles
 
 | Role | Description |
 |------|-------------|
-| **Owner** | Sets operator, configures caps, rescues dead pool tokens |
-| **Operator** | AMI agent — executes buybacks, burns, stakes, token purchases, rebalances |
-| **Permissionless** | Anyone — rebalances tokens that hit 1000%+ ROI after 14 days of operator inactivity |
+| **Owner** | Client who deploys the contract. Sets operator, configures caps, rescues dead pool tokens. |
+| **Operator** | AMI agent. Executes buybacks, burns, stakes, token purchases, and rebalances. |
+| **Permissionless** | Anyone. Triggers rebalances when tokens hit 1000%+ ROI after 14 days of operator inactivity. |
 
-### Contract Addresses (Base Mainnet)
+### Key Functions
 
-| Contract | Address |
-|----------|---------|
-| WETH | `0x4200000000000000000000000000000000000006` |
-| USDC | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
-| ÙSD (TurboUSD) | `0x583866fb22a3d67d7c45e1D0F34BcB20Bf9c6353` |
-| Official ÙSD/WETH V3 Pool | `0xAD501A478bF0F81C42C8C80ea08968f5Aa4c2f9A` |
-| Staking | `0x2a70a42BC0524aBCA9Bff59a51E7aAdB575DC89A` |
-| V3 SwapRouter02 | `0x2626664c2603336E57B271c5C0b26F421741e481` |
-| Universal Router | `0x6fF5693b99212Da76ad316178A184AB56D299b43` |
+#### Owner-Only
+- `setOperator(address)` — Set the AMI operator
+- `updateCaps(ActionType, perAction, perDay)` — Configure operator limits
+- `setSlippage(uint256 bps)` — Set operator slippage tolerance (max 10%)
+- `rescueDeadPoolToken(address, bytes)` — Rescue tokens from pools inactive 90+ days
 
-## Immutable Constants
+#### Operator-Only (60-min cooldown, caps enforced)
+- `buybackWithWETH(uint256)` — WETH → ₸USD via official pool
+- `buybackWithUSDC(uint256)` — USDC → WETH → ₸USD
+- `burn(uint256)` — Send ₸USD to 0xdead
+- `stake(uint256, uint256)` — Deposit ₸USD to staking contract
+- `unstake(uint256)` — Withdraw + rewards (no caps, no cooldown)
+- `buyTokenWithETH(address, uint256, bytes)` — Buy ERC20s, track cost basis
+- `rebalance(address, uint256, bytes, bytes)` — 75% → ₸USD, 25% → USDC to owner
 
-All safety parameters are hardcoded and cannot be changed:
+#### Permissionless
+- `permissionlessRebalance(address, uint256, bytes, bytes)` — Anyone can rebalance when:
+  - ROI ≥ 1000% (vs weighted average cost)
+  - 14 days since ROI tier reached with no operator rebalance
+  - Max 5% of unlocked per tx
+  - 4-hour cooldown per token
+  - Circuit breaker: blocks if ₸USD spot > 15% above 24h TWAP
+
+### Immutable Constants (Hardcoded, Never Changeable)
 
 | Parameter | Value |
 |-----------|-------|
-| Slippage (permissionless) | 3% |
-| Permissionless cooldown | 4 hours per token |
-| Max per swap (permissionless) | 5% of unlocked |
-| Circuit breaker vs 24h TWAP | 15% |
-| Operator inactivity period | 14 days |
-| Dead pool threshold | 90 days |
-| Operator cooldown | 60 minutes |
-| Per-action cap (permissionless) | 0.5 ETH |
-| Per-day cap (permissionless) | 2 ETH |
+| Permissionless Slippage | 3% (300 bps) |
+| Permissionless Cooldown | 4 hours |
+| Max Per Swap | 5% of unlocked |
+| Circuit Breaker | 15% vs 24h TWAP |
+| Operator Inactivity | 14 days |
+| Dead Pool Threshold | 90 days |
+| Operator Cooldown | 60 minutes |
+| Per-Action Cap | 0.5 ETH |
+| Per-Day Cap | 2 ETH |
 
-## Operator Caps (Owner-Configurable)
+### Default Operator Caps (Owner-Configurable)
 
 | Action | Per Action | Per Day |
 |--------|-----------|---------|
 | BuybackWETH | 0.5 ETH | 2 ETH |
 | BuybackUSDC | 2,000 USDC | 5,000 USDC |
-| Burn | 100M ÙSD | 500M ÙSD |
-| Stake | 100M ÙSD | 500M ÙSD |
+| Burn | 100M ₸USD | 500M ₸USD |
+| Stake | 100M ₸USD | 500M ₸USD |
 | Rebalance | 0.5 ETH (equiv) | 2 ETH (equiv) |
 
-## Functions
+## 🔒 Security
 
-### Owner-Only
-- `setOperator(address)` — Set AMI operator
-- `updateCaps(ActionType, perAction, perDay)` — Change operator caps
-- `setSlippage(uint256 bps)` — Operator slippage only
-- `rescueDeadPoolToken(address token, bytes path)` — After 90+ days dead pool
+- **Ownable2Step** — Two-step ownership transfer
+- **ReentrancyGuard** — On all external calls
+- **CEI Pattern** — Checks-Effects-Interactions
+- **SafeERC20** — Safe token transfers
+- **balanceOf deltas** — All accounting uses balance snapshots
+- **24h TWAP** — For ROI checks, circuit breaker, and slippage protection
+- **Integer safety** — Solidity 0.8.26 built-in overflow protection
 
-### Operator-Only
-- `buybackWithWETH(uint256 amountIn)` — WETH → ÙSD
-- `buybackWithUSDC(uint256 amountIn)` — USDC → WETH → ÙSD
-- `burn(uint256 amount)` — Partial burn of ÙSD
-- `stake(uint256 amount, uint256 poolId)` — Deposit to staking
-- `unstake(uint256 poolId)` — Withdraw + rewards (no caps, no cooldown)
-- `buyTokenWithETH(address token, uint256 amountETH, bytes path)` — Buy ERC20 with ETH
-- `rebalance(address token, uint256 amount, bytes pathToWETH, bytes pathToUSDC)` — 75/25 split rebalance
-
-### Permissionless
-- `permissionlessRebalance(address token, uint256 amount, bytes pathToWETH, bytes pathToUSDC)` — Anyone can call if conditions met
-
-## Permissionless Unlock Schedule
-
-**Unlock Conditions (both required):**
-1. ROI ≥ 1000% vs weighted average cost
-2. No operator rebalance for 14 days since current ROI tier was first reached
-
-**Ratcheted unlock (never decreases):**
-- 1000% ROI → 25% unlocked
-- Each additional 10% above → 5% of remaining locked unlocks
-
-## Security
-
-- **ReentrancyGuard** on all external-calling functions
-- **Checks-Effects-Interactions** pattern throughout
-- **SafeERC20** for all token operations
-- **balanceOf deltas** for all accounting (handles fee-on-transfer/rebasing)
-- **No withdrawals** — tokens can never leave except through defined paths
-- **No selling ÙSD** — one-directional flow enforced
-- **Circuit breaker** — blocks permissionless if spot >15% above 24h TWAP
-
-## Build & Test
-
-```bash
-# Install dependencies
-forge install
-
-# Build
-forge build
-
-# Test
-forge test -vv
-```
-
-## Deploy
-
-```bash
-# Set environment variables
-export PRIVATE_KEY=<deployer_private_key>
-export OWNER_ADDRESS=<owner_address>
-export OPERATOR_ADDRESS=<operator_address>
-export USDC_RECIPIENT_ADDRESS=<usdc_recipient_address>
-
-# Deploy to Base
-forge script script/DeployTreasuryManagerV2.s.sol \
-    --rpc-url https://mainnet.base.org \
-    --broadcast \
-    --verify
-
-# Verify on Basescan
-forge verify-contract <contract_address> TreasuryManagerV2 \
-    --chain-id 8453 \
-    --constructor-args $(cast abi-encode "constructor(address,address,address)" $OWNER_ADDRESS $OPERATOR_ADDRESS $USDC_RECIPIENT_ADDRESS) \
-    --etherscan-api-key <basescan_api_key>
-```
-
-## Contract Prohibitions
-
-- ❌ No withdrawals
-- ❌ No selling ÙSD
-- ❌ WETH only swaps to ÙSD
-- ❌ USDC only swaps to ÙSD via WETH
+### Contract Prohibitions
+- ❌ No withdrawals of any kind
+- ❌ No selling ₸USD
 - ❌ No LP management
 - ❌ No changing permissionless parameters
-- ❌ ETH only for buying ERC20s
-- ❌ ERC20s only to WETH/USDC via rebalance
-- ✅ All ÙSD purchases through official pool only
+- ❌ All ₸USD purchases through official pool only
 
-## License
+## 🛠 Development
+
+### Prerequisites
+- [Foundry](https://book.getfoundry.sh/getting-started/installation)
+- [Node.js 18+](https://nodejs.org/)
+- [Yarn](https://yarnpkg.com/)
+
+### Build & Test
+
+```bash
+# Build contract
+forge build
+
+# Run tests
+forge test -vvv
+
+# Deploy (set env vars first)
+PRIVATE_KEY=... OWNER_ADDRESS=... OPERATOR_ADDRESS=... USDC_RECIPIENT_ADDRESS=... \
+  forge script script/DeployTreasuryManagerV2.s.sol --rpc-url $RPC_URL --broadcast
+```
+
+### Frontend
+
+```bash
+cd packages/nextjs
+yarn install
+yarn dev
+```
+
+## 📜 License
 
 MIT
