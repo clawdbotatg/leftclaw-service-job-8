@@ -7,7 +7,7 @@ import { formatEther, formatUnits } from "viem";
 import { useScaffoldReadContract, useScaffoldWriteContract } from "~~/hooks/scaffold-eth";
 import { Address } from "@scaffold-ui/components";
 
-const CONTRACT_ADDRESS = "0x65570ab49e29C7f0D2931e8Aca269EA18Da5b32a";
+const CONTRACT_ADDRESS = "0xC5127c4b0e5AC19088D233AB43C0FFd1E1134332";
 
 const Home: NextPage = () => {
   const { address: connectedAddress } = useAccount();

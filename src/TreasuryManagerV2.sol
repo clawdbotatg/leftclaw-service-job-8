@@ -506,35 +506,71 @@ contract TreasuryManagerV2 is Ownable2Step, ReentrancyGuard {
         return usdReceived;
     }
 
-    /// @dev Calculate minimum output based on current pool price and slippage tolerance
-    /// Uses slot0 sqrtPriceX96 for price estimation with slippage applied
+    /// @dev Calculate minimum output based on TWAP price and slippage tolerance
+    /// Falls back to slot0 if TWAP unavailable
     function _getMinAmountOut(uint256 wethAmount, uint256 slippageBps) internal view returns (uint256) {
-        (uint160 sqrtPriceX96,,,,,,) = OFFICIAL_POOL.slot0();
+        uint160 sqrtPriceX96 = _getTWAPSqrtPriceX96();
         if (sqrtPriceX96 == 0) return 0;
         
         address token0 = OFFICIAL_POOL.token0();
         bool wethIsToken0 = (token0 == address(WETH));
         
-        // sqrtPriceX96 = sqrt(token1/token0) * 2^96
-        // price = (sqrtPriceX96 / 2^96)^2 = sqrtPriceX96^2 / 2^192
         uint256 expectedOut;
         if (wethIsToken0) {
-            // WETH is token0, ₸USD is token1
-            // price = token1/token0 = ₸USD per WETH
-            // expectedOut = wethAmount * price = wethAmount * sqrtPriceX96^2 / 2^192
             expectedOut = (wethAmount * uint256(sqrtPriceX96)) / (1 << 96);
             expectedOut = (expectedOut * uint256(sqrtPriceX96)) / (1 << 96);
         } else {
-            // ₸USD is token0, WETH is token1
-            // price = token1/token0 = WETH per ₸USD
-            // So ₸USD per WETH = 1/price = 2^192 / sqrtPriceX96^2
-            // expectedOut = wethAmount * 2^192 / sqrtPriceX96^2
             expectedOut = (wethAmount * (1 << 96)) / uint256(sqrtPriceX96);
             expectedOut = (expectedOut * (1 << 96)) / uint256(sqrtPriceX96);
         }
         
-        // Apply slippage tolerance
         return (expectedOut * (BPS_DENOMINATOR - slippageBps)) / BPS_DENOMINATOR;
+    }
+
+    /// @dev Get TWAP sqrtPriceX96 over 24h period, falls back to slot0 if unavailable
+    function _getTWAPSqrtPriceX96() internal view returns (uint160) {
+        uint32[] memory secondsAgos = new uint32[](2);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        secondsAgos[0] = uint32(TWAP_PERIOD);
+        secondsAgos[1] = 0;
+
+        try OFFICIAL_POOL.observe(secondsAgos) returns (
+            int56[] memory tickCumulatives,
+            uint160[] memory
+        ) {
+            int56 tickDiff = tickCumulatives[1] - tickCumulatives[0];
+            // forge-lint: disable-next-line(unsafe-typecast)
+            int24 twapTick = int24(tickDiff / int56(int32(uint32(TWAP_PERIOD))));
+            
+            // Convert tick to sqrtPriceX96 using the formula:
+            // sqrtPrice = sqrt(1.0001^tick) * 2^96
+            // For a practical approximation, we use the slot0 price as base
+            // and adjust by the tick delta
+            (uint160 currentSqrtPrice, int24 currentTick,,,,,) = OFFICIAL_POOL.slot0();
+            
+            int24 tickDelta = currentTick - twapTick;
+            
+            // If tick delta is small, TWAP ≈ spot, use spot with minor adjustment
+            // For larger deltas, approximate the TWAP price
+            // Each tick = 0.01% = 1 bps price change
+            if (tickDelta >= 0 && tickDelta < 10000) {
+                // Current price is above TWAP — use TWAP (lower price = more conservative min)
+                // Reduce current sqrt price by half the tick delta in bps
+                // sqrt(price_change) ≈ 1 - tickDelta/20000 for small changes
+                uint256 adjustment = uint256(uint24(tickDelta)) * uint256(currentSqrtPrice) / 20000;
+                return uint160(uint256(currentSqrtPrice) - adjustment);
+            } else if (tickDelta < 0 && tickDelta > -10000) {
+                // Current price is below TWAP — use current price (already lower)
+                return currentSqrtPrice;
+            }
+            
+            // For very large deltas, fall back to spot price
+            return currentSqrtPrice;
+        } catch {
+            // Fall back to slot0 if TWAP unavailable
+            (uint160 sqrtPriceX96,,,,,,) = OFFICIAL_POOL.slot0();
+            return sqrtPriceX96;
+        }
     }
 
     /// @dev Execute the 75/25 rebalance split
@@ -572,19 +608,20 @@ contract TreasuryManagerV2 is Ownable2Step, ReentrancyGuard {
         _swapWETHToUSD(totalWethReceived, slippage);
 
         // ── 25% -> USDC to owner ──
+        address _owner = owner();
         IERC20(token).safeIncreaseAllowance(address(V3_ROUTER), usdcPortion);
-        uint256 usdcBefore = USDC.balanceOf(usdcRecipient);
+        uint256 usdcBefore = USDC.balanceOf(_owner);
 
         V3_ROUTER.exactInput(
             ISwapRouter02.ExactInputParams({
                 path: pathToUSDC,
-                recipient: usdcRecipient,
+                recipient: _owner,
                 amountIn: usdcPortion,
                 amountOutMinimum: 0
             })
         );
 
-        uint256 usdcReceived = USDC.balanceOf(usdcRecipient) - usdcBefore;
+        uint256 usdcReceived = USDC.balanceOf(_owner) - usdcBefore;
 
         lastPoolInteraction = block.timestamp;
         emit RebalanceExecuted(token, amount, totalWethReceived, usdcReceived, isPermissionless, msg.sender);

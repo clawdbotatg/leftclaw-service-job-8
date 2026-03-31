@@ -3,7 +3,7 @@ import { GenericContractsDeclaration } from "~~/utils/scaffold-eth/contract";
 const deployedContracts = {
   8453: {
     TreasuryManagerV2: {
-      address: "0x65570ab49e29C7f0D2931e8Aca269EA18Da5b32a",
+      address: "0xC5127c4b0e5AC19088D233AB43C0FFd1E1134332",
       abi: [
       {
             "type": "constructor",
