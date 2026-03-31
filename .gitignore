@@ -2,3 +2,10 @@ out/
 cache/
 .env
 broadcast/
+node_modules/
+.next/
+packages/nextjs/out/
+.yarn/
+*.pnp.*
+.yarn/
+.yarnrc.yml
